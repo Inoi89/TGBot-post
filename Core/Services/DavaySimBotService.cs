@@ -6,7 +6,9 @@ using Infrastructure.Contracts;
 using Models.Options;
 using Telegram.Bot.Polling;
 using Telegram.Bot.Types.Enums;
+using Telegram.Bot.Types.ReplyMarkups;
 using System.IO;
+using Telegram.Bot.Exceptions;
 
 namespace Core.Services
 {
@@ -14,6 +16,9 @@ namespace Core.Services
     {
         private readonly IImageService _imageService;
 
+        // Либо я тупой, либо ебаный телеграм апи не отдаёт сообщения по айди
+        // Поэтому для обработки, их приходится где-то хранить
+        private Dictionary<long, Message> _messageStorage = new Dictionary<long, Message>();
         public DavaySimBotService(IImageService imageService, ILogger logger) : base(logger)
         {
             _imageService = imageService;
@@ -21,10 +26,8 @@ namespace Core.Services
 
         public override async Task ExecuteAsync()
         {
-            // Логика выполнения для DavaySimBot
-            while (true) // Бесконечный цикл
+            while (true)
             {
-                // Подгрузка файлов из папки                        
                 FileInfo[] imageFiles = _imageService.ProcessImages();
 
                 if (imageFiles.Length == 0)
@@ -33,54 +36,57 @@ namespace Core.Services
                 }
                 else
                 {
-                    // Проверьте, прошел ли хотя бы час с момента последней публикации
-                    if (IsMoscowTimeAllowed()) // fileLogger.HasElapsedOneHourSinceLastPost()
+                    if (IsMoscowTimeAllowed())
                     {
-                        // Прошло достаточно времени, можно продолжить с публикацией изображений
                         Logger.Log(LogMessageType.Info, "Изображения найдены, хуячу дальше.");
                         await ProcessImageFilesAsync(imageFiles);
-
-                        //fileLogger.Log(MessageType.Trace, DateTime.Now.TimeOfDay.ToString());
                     }
                     else
                     {
                         Logger.Log(LogMessageType.Info, "Не время постить");
                     }
                 }
-                // Задержка перед следующей итерацией
+
                 Random random = new Random();
-                int minDelayMinutes = 60; // Минимальная задержка в минутах
-                int maxDelayMinutes = 220; // Максимальная задержка в минутах
+                int minDelayMinutes = 60;
+                int maxDelayMinutes = 220;
                 int randomDelayMinutes = random.Next(minDelayMinutes, maxDelayMinutes + 1);
                 Logger.Log(LogMessageType.Info, $"Хули, ждём {randomDelayMinutes}");
                 await Task.Delay(TimeSpan.FromMinutes(randomDelayMinutes));
-
             }
         }
 
-        // Общее описание прослушки ботом постов
         public override async Task StartRecieving()
         {
             var client = BotClient;
             var path = _imageService.FolderPath;
-            
 
             var cts = new CancellationTokenSource();
             var receiverOptions = new ReceiverOptions
             {
-                AllowedUpdates = { } // По умолчанию принимаются все типы обновлений
+                AllowedUpdates = new[] { UpdateType.Message, UpdateType.CallbackQuery }
             };
-            BotClient.StartReceiving(
-            HandleUpdateAsync,
-            HandleErrorAsync,
-            receiverOptions,
-            cancellationToken: cts.Token);
-            
-            Logger.Log(LogMessageType.Trace, $"Хули, ресивинг фоток в {path} тоже запущен");
 
+            BotClient.StartReceiving(
+                async (botClient, update, cancellationToken) =>
+                {
+                    if (update.Type == UpdateType.Message)
+                    {
+                        await HandleUpdateAsync(botClient, update, cancellationToken);
+                    }
+                    else if (update.Type == UpdateType.CallbackQuery)
+                    {
+                        await HandleCallbackQueryAsync(botClient, update.CallbackQuery, cancellationToken);
+                    }
+                },
+                HandleErrorAsync,
+                receiverOptions,
+                cancellationToken: cts.Token
+            );
+
+            Logger.Log(LogMessageType.Trace, $"Ресивинг фоток в {path} тоже запущен");
         }
 
-        // Метод, в котором бот принимает картиночки в личные сообщения, сохраняет в папочку - после чего удаляет их из переписки
         private async Task HandleUpdateAsync(ITelegramBotClient botClient, Update update, CancellationToken cancellationToken)
         {
             if (update.Type != UpdateType.Message)
@@ -88,57 +94,164 @@ namespace Core.Services
 
             Message? message = update.Message;
 
-            // Здесь мы реагируем на посты только в личке
             if (message.Chat.Type != ChatType.Private)
                 return;
 
-            if (message.Chat.Type == ChatType.Private && message.Type == MessageType.Photo)
+            long userId = message.From.Id;
+
+            if (message.Type == MessageType.Text && message.Text == "/start")
             {
-                Logger.Log(LogMessageType.Info, $"Получено сообщение с фотографией");
+                await botClient.SendTextMessageAsync(message.Chat.Id, "Привет, я бот канала @davaySim! Я сохраняю мемасики. " +
+                    "Мне их, собственно, можно скидывать, ес чо, я их пересылаю с кнопочками аппрувнуть - или нет. Потом они попадают в общий пул, и оттуда я же их когда-нибудь и запосчу. " +
+                    "Пока я не умею сохранять подписи к картинке, распознаю только картинку и видосик, а комментарий как текст - идёт отдельным сообщением, и я не умею их совмещать и сохранять. Пока что! " +
+                    "Такие дела, жду смешные картиночки получается. ", cancellationToken: cancellationToken);
+                Logger.Log(LogMessageType.Info, $"Приветственное сообщение отправлено пользователю {userId}");
+                return; 
+            }
 
-                var photo = message.Photo.OrderByDescending(p => p.FileSize).FirstOrDefault(); // Выбираем фото с наибольшим размером
-                if (photo != null)
-                {
-                    var fileId = photo.FileId;
-                    var fileInfo = await botClient.GetFileAsync(fileId, cancellationToken);
-                    var filePath = fileInfo.FilePath;
-                    var savePath = Path.Combine(_imageService.FolderPath, $"{fileId}.jpg"); 
+            if (userId == 34999765)
+            {
+                await HandleUserMessageAsync(botClient, message, cancellationToken);
+            }
+            else
+            {
+                Logger.Log(LogMessageType.Info, $"Получено сообщение от другого пользователя (ID: {userId})");
+                var forwardedMessage = await botClient.ForwardMessageAsync(chatId: 34999765, fromChatId: message.Chat.Id, messageId: message.MessageId, cancellationToken: cancellationToken);
 
-                    using (var fileStream = new FileStream(savePath, FileMode.Create))
-                    {
-                        await botClient.DownloadFileAsync(filePath, fileStream, cancellationToken);
-                        Logger.Log(LogMessageType.Info, $"Фотография сохранена по пути: {savePath}");
-                    }
+                // Сохраняем в ебаный стораж
+                _messageStorage[forwardedMessage.MessageId] = forwardedMessage;
 
-                    await botClient.DeleteMessageAsync(message.Chat.Id, message.MessageId);
-                    // Logger.Log(LogMessageType.Debug, $"Удалил из личной переписки");
-                }
+                await botClient.SendTextMessageAsync(
+                    chatId: 34999765,
+                    text: "Одобрить или отклонить сообщение?",
+                    replyMarkup: GetApprovalKeyboard(forwardedMessage.MessageId),
+                    cancellationToken: cancellationToken
+                );
+                Logger.Log(LogMessageType.Info, "Сообщение переслано мне с кнопками одобрения");
             }
         }
 
-        // Метод, который берёт картиночки из папочки и постит
+        private async Task HandleCallbackQueryAsync(ITelegramBotClient botClient, CallbackQuery callbackQuery, CancellationToken cancellationToken)
+        {
+            var callbackData = callbackQuery.Data;
+            await botClient.AnswerCallbackQueryAsync(callbackQuery.Id, "Обработка...", cancellationToken: cancellationToken);
+
+            if (callbackData.StartsWith("approve_"))
+            {
+                var messageId = int.Parse(callbackData.Split('_')[1]);
+
+                if (_messageStorage.TryGetValue(messageId, out var message))
+                {
+                    await HandleUserMessageAsync(botClient, message, cancellationToken);
+                    _messageStorage.Remove(messageId);
+                }
+                else
+                {
+                    Logger.Log(LogMessageType.Info, $"Сообщение с ID {messageId} не найдено в хранилище.");
+                }
+
+                Logger.Log(LogMessageType.Info, "Сообщение одобрено и сохранено.");
+            }
+            else if (callbackData.StartsWith("reject_"))
+            {
+                var messageId = int.Parse(callbackData.Split('_')[1]);
+                var chatId = callbackQuery.Message.Chat.Id;
+
+                try
+                {
+                    await botClient.DeleteMessageAsync(chatId, messageId, cancellationToken); // Удаляем оригинальное сообщение
+                    _messageStorage.Remove(messageId);
+                    Logger.Log(LogMessageType.Info, "Сообщение отклонено и удалено.");
+                }
+                catch (ApiRequestException ex)
+                {
+                    Logger.Log(LogMessageType.Error, $"Ошибка при удалении сообщения: {ex.Message}");
+                }
+            }
+
+            try
+            {
+                await botClient.DeleteMessageAsync(callbackQuery.Message.Chat.Id, callbackQuery.Message.MessageId, cancellationToken);
+            }
+            catch (ApiRequestException ex)
+            {
+                Logger.Log(LogMessageType.Error, $"Ошибка при удалении сообщения с кнопками: {ex.Message}");
+            }
+        }
+
+
+        private InlineKeyboardMarkup GetApprovalKeyboard(int messageId)
+        {
+            return new InlineKeyboardMarkup(new[]
+            {
+                new []
+                {
+                    InlineKeyboardButton.WithCallbackData(text: "✅ Одобрить", callbackData: $"approve_{messageId}"),
+                    InlineKeyboardButton.WithCallbackData(text: "❌ Отклонить", callbackData: $"reject_{messageId}")
+                }
+            });
+        }
+
+        private async Task HandleUserMessageAsync(ITelegramBotClient botClient, Message message, CancellationToken cancellationToken)
+        {
+            switch (message.Type)
+            {
+                case MessageType.Photo:
+                    Logger.Log(LogMessageType.Info, "Получено сообщение с фотографией от меня");
+                    var photo = message.Photo.OrderByDescending(p => p.FileSize).FirstOrDefault();
+                    if (photo != null)
+                    {
+                        await SavePhotoAsync(botClient, photo, _imageService.FolderPath, cancellationToken);
+                    }
+                    break;
+
+                case MessageType.Video:
+                    Logger.Log(LogMessageType.Info, "Получено сообщение с видео от меня");
+                    await SaveVideoAsync(botClient, message.Video, _imageService.FolderPath, cancellationToken);
+                    break;
+
+                case MessageType.Text:
+                    Logger.Log(LogMessageType.Info, "Получено текстовое сообщение от меня");
+                    Console.WriteLine($"Текст от вас: {message.Text}");
+                    break;
+
+                default:
+                    Logger.Log(LogMessageType.Info, $"Получен неподдерживаемый тип сообщения от меня: {message.Type}");
+                    break;
+            }
+
+            try
+            {
+                await botClient.DeleteMessageAsync(message.Chat.Id, message.MessageId, cancellationToken);
+                Logger.Log(LogMessageType.Info, "Сообщение успешно удалено.");
+            }
+            catch (ApiRequestException ex) when (ex.Message.Contains("message to delete not found"))
+            {
+                Logger.Log(LogMessageType.Error, "Сообщение не найдено для удаления, возможно, оно уже было удалено.");
+            }
+        }
+
         private async Task ProcessImageFilesAsync(FileInfo[] imageFiles)
         {
-
             Random random = new Random();
-            int minImagesToPost = 1; // Минимальное количество изображений для постинга
-            int maxImagesToPost = 4; // Максимальное количество изображений для постинга
+            int minImagesToPost = 1;
+            int maxImagesToPost = 4;
             FileInfo[] randomImageFiles = imageFiles;
 
             if (imageFiles.Length > maxImagesToPost)
             {
                 Logger.Log(LogMessageType.Debug, "Картинок больше 6");
-                // Выбираем случайное количество изображений
                 int imagesToPost = random.Next(minImagesToPost, maxImagesToPost + 1);
-
-                // Выбираем случайное подмножество изображений
                 randomImageFiles = imageFiles.OrderBy(_ => random.Next()).Take(imagesToPost).ToArray();
             }
-            else { Logger.Log(LogMessageType.Debug, "Картинок меньше 6"); }
+            else
+            {
+                Logger.Log(LogMessageType.Debug, "Картинок меньше 6");
+                return;
+            }
 
             foreach (FileInfo imageFile in randomImageFiles)
             {
-                // string chatId = botConfig.ChatId;
                 using (FileStream stream = new FileStream(imageFile.FullName, FileMode.Open))
                 {
                     InputFileStream file = new InputFileStream(stream);
@@ -152,31 +265,52 @@ namespace Core.Services
                 }
                 Logger.Log(LogMessageType.Trace, "Запостил");
 
-                // Удалить файл после обработки
                 imageFile.Delete();
+            }
+        }
+
+        private async Task SavePhotoAsync(ITelegramBotClient botClient, PhotoSize photo, string folderPath, CancellationToken cancellationToken)
+        {
+            var fileId = photo.FileId;
+            var fileInfo = await botClient.GetFileAsync(fileId, cancellationToken);
+            var filePath = fileInfo.FilePath;
+            var savePath = Path.Combine(folderPath, $"{fileId}.jpg");
+
+            using (var fileStream = new FileStream(savePath, FileMode.Create))
+            {
+                await botClient.DownloadFileAsync(filePath, fileStream, cancellationToken);
+                Logger.Log(LogMessageType.Info, $"Фотография сохранена по пути: {savePath}");
+            }
+        }
+
+        private async Task SaveVideoAsync(ITelegramBotClient botClient, Video video, string folderPath, CancellationToken cancellationToken)
+        {
+            var fileId = video.FileId;
+            var fileInfo = await botClient.GetFileAsync(fileId, cancellationToken);
+            var filePath = fileInfo.FilePath;
+            var savePath = Path.Combine(folderPath, $"{fileId}.mp4");
+
+            using (var fileStream = new FileStream(savePath, FileMode.Create))
+            {
+                await botClient.DownloadFileAsync(filePath, fileStream, cancellationToken);
+                Logger.Log(LogMessageType.Info, $"Видео сохранено по пути: {savePath}");
             }
         }
 
         public static bool IsMoscowTimeAllowed()
         {
-            // Устанавливаем информацию о временной зоне для Москвы
             TimeZoneInfo moscowTimeZone = TimeZoneInfo.FindSystemTimeZoneById("Russian Standard Time");
-
-            // Получаем текущее время в Московской временной зоне
             DateTime moscowTime = TimeZoneInfo.ConvertTimeFromUtc(DateTime.UtcNow, moscowTimeZone);
+            int endHour = 10;
 
-            // Устанавливаем граничные часы для проверки времени
-            int endHour = 10;   // 10 часов утра
-
-            // Проверяем, находится ли текущее время в указанном диапазоне
             if (moscowTime.Hour < endHour)
             {
                 Console.WriteLine($"{moscowTime.Hour} не больше {endHour}");
-                return false;  // В этот период времени не постим
+                return false;
             }
             else
             {
-                return true;   // В остальное время можно постить
+                return true;
             }
         }
 
@@ -185,6 +319,5 @@ namespace Core.Services
             Logger.Log(LogMessageType.Error, $"Ошибка: {exception.Message}");
             return Task.CompletedTask;
         }
-
     }
 }

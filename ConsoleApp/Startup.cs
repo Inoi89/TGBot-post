@@ -30,6 +30,7 @@ namespace ConsoleApp
             services.AddScoped<DavaySimBotService>();
 
             services.AddScoped<IImageService, ImageService>();
+           // services.AddSingleton(resolver => resolver.GetRequiredService<IOptions<BotSettings>>().Value);
 
             AddOptions(services, config);
 
@@ -41,7 +42,9 @@ namespace ConsoleApp
             services.AddOptions();
             services.Configure<FileLoggerOptions>(configuration.GetSection("FileLoggerOptions"));
             services.Configure<ImageProcessingOptions>(configuration.GetSection("ImageProcessingOptions"));
+            services.Configure<BotSettings>(configuration.GetSection("BotSettings"));
             services.AddSingleton<IConfigureOptions<BotOptions>, ConfigureBotOptions>();
+            
         }
     }
 }

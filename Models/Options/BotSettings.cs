@@ -8,5 +8,6 @@
 
         public string ChatId { get; set; }
         public string TempChatId { get; set; }
+        public long UserId { get; set; }
     }
 }
